@@ -810,11 +810,10 @@ async def buy(callback: CallbackQuery):
     except (ValueError, IndexError):
         return
 
-    user_id = callback.from_user.id
-
-        con = await db()
-
+    user_id = callback.from_user.id. 
     try:
+        con = await db()
+    
         await con.execute("BEGIN IMMEDIATE")
 
         # Проверяем товар
