@@ -812,4 +812,416 @@ async def buy(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
-    con 
+        con = await db()
+
+    try:
+        await con.execute("BEGIN IMMEDIATE")
+
+        # Проверяем товар
+        cur = await con.execute(
+            """
+            SELECT id, name, price
+            FROM products
+            WHERE id = ?
+            """,
+            (product_id,),
+        )
+        product_row = await cur.fetchone()
+
+        if not product_row:
+            await con.rollback()
+            await con.close()
+            await callback.message.answer("❌ Товар не найден.")
+            return
+
+        _, product_name, price = product_row
+
+        # Проверяем баланс
+        cur = await con.execute(
+            """
+            SELECT balance
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        user_row = await cur.fetchone()
+
+        if not user_row:
+            await con.rollback()
+            await con.close()
+            await callback.message.answer(
+                "❌ Пользователь не найден. Нажми /start."
+            )
+            return
+
+        balance = float(user_row[0])
+
+        if balance < price:
+            await con.rollback()
+            await con.close()
+            await callback.message.answer(
+                f"❌ Недостаточно средств.\n\n"
+                f"Цена: <b>{price:.2f} USDT</b>\n"
+                f"Ваш баланс: <b>{balance:.2f} USDT</b>"
+            )
+            return
+
+        # Берём первый свободный товар
+        cur = await con.execute(
+            """
+            SELECT id, login, password, phone
+            FROM inventory
+            WHERE product_id = ?
+              AND sold = 0
+            ORDER BY id
+            LIMIT 1
+            """,
+            (product_id,),
+        )
+        item = await cur.fetchone()
+
+        if not item:
+            await con.rollback()
+            await con.close()
+            await callback.message.answer(
+                "❌ К сожалению, товара больше нет в наличии."
+            )
+            return
+
+        inventory_id, login, password, phone = item
+
+        # Списываем деньги
+        cur = await con.execute(
+            """
+            UPDATE users
+            SET balance = balance - ?
+            WHERE user_id = ?
+              AND balance >= ?
+            """,
+            (price, user_id, price),
+        )
+
+        if cur.rowcount != 1:
+            await con.rollback()
+            await con.close()
+            await callback.message.answer(
+                "❌ Не удалось списать средства. Попробуй ещё раз."
+            )
+            return
+
+        # Помечаем товар проданным
+        await con.execute(
+            """
+            UPDATE inventory
+            SET sold = 1,
+                sold_to = ?,
+                sold_at = ?
+            WHERE id = ?
+              AND sold = 0
+            """,
+            (user_id, utc_now(), inventory_id),
+        )
+
+        # Создаём заказ
+        await con.execute(
+            """
+            INSERT INTO orders
+                (user_id, product_id, inventory_id, price, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                product_id,
+                inventory_id,
+                price,
+                utc_now(),
+            ),
+        )
+
+        await con.commit()
+
+    except Exception:
+        await con.rollback()
+        logging.exception("Purchase error")
+        await con.close()
+
+        await callback.message.answer(
+            "❌ Произошла ошибка при покупке. Попробуй ещё раз."
+        )
+        return
+
+    await con.close()
+
+    # Показываем купленный товар
+    text = (
+        "✅ <b>Покупка успешно совершена!</b>\n\n"
+        f"🛒 Товар: <b>{html.escape(product_name)}</b>\n"
+        f"💵 Цена: <b>{price:.2f} USDT</b>\n\n"
+        "🔐 <b>Данные товара:</b>\n\n"
+        f"👤 Логин: <code>{html.escape(login)}</code>\n"
+        f"🔑 Пароль: <code>{html.escape(password)}</code>"
+    )
+
+    if phone:
+        text += f"\n📱 Телефон: <code>{html.escape(phone)}</code>"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_keyboard("products"),
+    )
+
+
+# =========================
+# PURCHASE HISTORY
+# =========================
+
+@dp.callback_query(F.data == "purchases")
+async def purchases(callback: CallbackQuery):
+    await callback.answer()
+
+    con = await db()
+
+    cur = await con.execute(
+        """
+        SELECT
+            o.id,
+            p.name,
+            o.price,
+            o.created_at
+        FROM orders o
+        JOIN products p ON p.id = o.product_id
+        WHERE o.user_id = ?
+        ORDER BY o.id DESC
+        LIMIT 20
+        """,
+        (callback.from_user.id,),
+    )
+
+    rows = await cur.fetchall()
+    await con.close()
+
+    if not rows:
+        await callback.message.edit_text(
+            "🧾 <b>Покупки</b>\n\n"
+            "У тебя пока нет покупок.",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    text = "🧾 <b>Последние покупки</b>\n\n"
+
+    for order_id, name, price, created_at in rows:
+        text += (
+            f"#{order_id} — <b>{html.escape(name)}</b>\n"
+            f"💵 {price:.2f} USDT\n"
+            f"🕐 {html.escape(created_at[:19])}\n\n"
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_keyboard(),
+    )
+
+
+# =========================
+# SUPPORT
+# =========================
+
+@dp.callback_query(F.data == "support")
+async def support(callback: CallbackQuery):
+    await callback.answer()
+
+    username = SUPPORT_USERNAME.lstrip("@")
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🆘 Написать в поддержку",
+                    url=f"https://t.me/{username}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        "🆘 <b>Поддержка</b>\n\n"
+        "Если у тебя возникла проблема с ботом или покупкой, "
+        "напиши в поддержку.",
+        reply_markup=keyboard,
+    )
+
+
+# =========================
+# CHECK SUBSCRIPTION
+# =========================
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery):
+    await callback.answer()
+
+    if await is_subscribed(callback.from_user.id):
+        await callback.message.edit_text(
+            "✅ Подписка подтверждена!\n\n"
+            "Теперь бот доступен.",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await callback.message.answer(
+            "❌ Ты ещё не подписался на канал."
+        )
+
+
+# =========================
+# ADMIN
+# =========================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещён.")
+        return
+
+    await message.answer(
+        "🛠 <b>Админ-панель</b>\n\n"
+        "Выбери раздел:",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    await callback.answer()
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    con = await db()
+
+    cur = await con.execute("SELECT COUNT(*) FROM users")
+    users_count = (await cur.fetchone())[0]
+
+    cur = await con.execute(
+        "SELECT COUNT(*) FROM orders"
+    )
+    orders_count = (await cur.fetchone())[0]
+
+    cur = await con.execute(
+        "SELECT COALESCE(SUM(price), 0) FROM orders"
+    )
+    revenue = (await cur.fetchone())[0]
+
+    cur = await con.execute(
+        "SELECT COALESCE(SUM(balance), 0) FROM users"
+    )
+    balances = (await cur.fetchone())[0]
+
+    await con.close()
+
+    await callback.message.edit_text(
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"🛒 Покупок: <b>{orders_count}</b>\n"
+        f"💰 Продаж: <b>{float(revenue):.2f} USDT</b>\n"
+        f"💳 Балансы пользователей: <b>{float(balances):.2f} USDT</b>",
+        reply_markup=back_keyboard("admin"),
+    )
+
+
+@dp.callback_query(F.data == "admin_products")
+async def admin_products(callback: CallbackQuery):
+    await callback.answer()
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    con = await db()
+
+    cur = await con.execute(
+        """
+        SELECT
+            p.id,
+            p.name,
+            p.price,
+            COUNT(i.id)
+        FROM products p
+        LEFT JOIN inventory i
+            ON i.product_id = p.id
+            AND i.sold = 0
+        GROUP BY p.id
+        ORDER BY p.id
+        """
+    )
+
+    rows = await cur.fetchall()
+    await con.close()
+
+    text = "📦 <b>Товары</b>\n\n"
+
+    for product_id, name, price, stock in rows:
+        text += (
+            f"#{product_id} <b>{html.escape(name)}</b>\n"
+            f"💵 {price:.2f} USDT\n"
+            f"📦 В наличии: {stock}\n\n"
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_keyboard("admin"),
+    )
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_menu(callback: CallbackQuery):
+    await callback.answer()
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    await callback.message.edit_text(
+        "🛠 <b>Админ-панель</b>\n\n"
+        "Выбери раздел:",
+        reply_markup=admin_keyboard(),
+    )
+
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+@dp.error()
+async def error_handler(event):
+    logging.exception("Unhandled bot error", exc_info=event.exception)
+
+
+# =========================
+# START BOT
+# =========================
+
+async def main():
+    await init_db()
+
+    logging.info("Bot starting...")
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
